@@ -22,7 +22,7 @@ services:
     volumes:
       - ./attacker:/app
     working_dir: /app
-    command: ["bash", "-c", "python3 udp_flooder.py --target 172.20.7.20 --port 9999 --mode spray --rate 100 --payload-size 64 --threads 4 --burst-on 3 --burst-off 5 --log /app/flood.log"]
+    command: ["bash", "-c", "python3 udp_flooder.py --target 172.20.7.20 --port 9999 --mode flood --rate 100 --payload-size 64 --threads 4 --burst-on 3 --burst-off 5 --log /app/flood_mode_flood.json"]
     stdin_open: true
     tty: true
 
@@ -52,4 +52,4 @@ services:
     volumes:
       - ./detector:/app
     working_dir: /app
-    command: ["bash", "-c", "DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y --no-install-recommends tcpdump -qq && pip install scapy --quiet && python3 udp_detector.py --interface eth0 --flood-threshold 50 --port-threshold 20 --burst-multiplier 3 --window 30 --log /app/udp_alerts.log"]
+    command: ["bash", "-c", "DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y --no-install-recommends tcpdump -qq && pip install scapy --quiet && python3 udp_detector.py --interface eth0 --flood-threshold 50 --port-threshold 20 --burst-multiplier 3 --window 30 --log /app/udp_alerts_moode_flood.json"]
