@@ -56,71 +56,131 @@ class SourceState:
     last_seen: float = 0.0
     # Hold the D2 BurstWindow instance once D2 wires it in:
     burst_window: object = None
+    # D1 addition: per-packet log for accurate sliding-window eviction
+    packet_log: deque = field(default_factory=deque)  # stores (timestamp, dport)
 
 
 def is_whitelisted(src_ip: str, whitelist: set) -> bool:
     """Owner: D1. Exact-match for v1; consider CIDR later if needed."""
-    raise NotImplementedError("D1: implement.")
+    return src_ip in whitelist
 
 
 def update_state(state: SourceState, dport: int, now: float, args) -> None:
-    """
-    Owner: D1.
+    """Owner: D1."""
 
-    1. state.packets_per_dport[dport] += 1
-    2. state.unique_dports.add(dport)
-    3. Append (int(now), 1) to per_second_counts, or bump the tail
-       if the last tuple is for the same second.
-    4. Evict entries older than args.window seconds from all three
-       structures (this is what makes them sliding-window).
-    5. state.last_seen = now
-    """
-    raise NotImplementedError("D1: implement.")
+    # Log this packet with its timestamp
+    state.packet_log.append((now, dport))
+
+    # Evict packets outside the sliding window
+    cutoff = now - args.window
+    while state.packet_log and state.packet_log[0][0] < cutoff:
+        state.packet_log.popleft()
+
+    # Rebuild packets_per_dport and unique_dports from what remains in window
+    state.packets_per_dport = defaultdict(int)
+    state.unique_dports = set()
+    for ts, dp in state.packet_log:
+        state.packets_per_dport[dp] += 1
+        state.unique_dports.add(dp)
+
+    # Update per_second_counts (used by D2's BurstWindow)
+    second = int(now)
+    if state.per_second_counts and state.per_second_counts[-1][0] == second:
+        # tuples are immutable — pop and re-append with bumped count
+        ts, cnt = state.per_second_counts.pop()
+        state.per_second_counts.append((ts, cnt + 1))
+    else:
+        state.per_second_counts.append((second, 1))
+
+    # Evict old seconds from per_second_counts
+    while state.per_second_counts and state.per_second_counts[0][0] < cutoff:
+        state.per_second_counts.popleft()
+
+    # Update last_seen
+    state.last_seen = now
 
 
 def packet_callback(pkt, state_table, args, alert_logger):
-    """
-    Scapy `prn` hook. Owner: D1.
+    """Scapy prn hook. Owner: D1."""
 
-    1. If not (IP in pkt and UDP in pkt): return.
-    2. src = pkt[IP].src ; dport = pkt[UDP].dport
-    3. If is_whitelisted(src, args.whitelist): return.
-    4. state = state_table[src] (create if missing; attach D2 BurstWindow).
-    5. update_state(state, dport, now, args)
-    6. For check in (check_flood, check_spray, check_burst):
-           fired, evidence = check(state, args)
-           if fired: alert_logger.emit(src, check.__name__, evidence)
-    """
-    raise NotImplementedError("D1: implement.")
+    # Only process IP/UDP packets
+    if not (IP in pkt and UDP in pkt):
+        return
+
+    src   = pkt[IP].src
+    dport = pkt[UDP].dport
+    now   = time.time()
+
+    # Skip whitelisted IPs
+    if is_whitelisted(src, args.whitelist):
+        return
+
+    # Create state entry on first packet from this source
+    if src not in state_table:
+        state_table[src] = SourceState()
+        # Attach D2's BurstWindow (guarded so code works before D2 merges)
+        try:
+            state_table[src].burst_window = BurstWindow(
+                args.window, args.burst_multiplier
+            )
+        except Exception:
+            pass
+
+    state = state_table[src]
+
+    # Update sliding-window state
+    update_state(state, dport, now, args)
+
+    # Feed the BurstWindow if it exists
+    if state.burst_window is not None:
+        try:
+            state.burst_window.add(now)
+        except Exception:
+            pass
+
+    # Run all three detectors; emit alert on any hit
+    for check in (check_flood, check_spray, check_burst):
+        try:
+            fired, evidence = check(state, args)
+            if fired:
+                alert_logger.emit(src, check.__name__, evidence)
+        except NotImplementedError:
+            pass  # D2's check_burst not done yet — skip gracefully
 
 
 def start_sniffer(args, state_table, alert_logger) -> None:
-    """
-    Run scapy.sniff() on args.interface. Owner: D1.
-
-    BPF filter: "udp" — cheap and avoids parsing non-UDP traffic.
-    Pass `store=False` so memory doesn't grow.
-    """
-    raise NotImplementedError("D1: implement.")
+    """Run scapy.sniff() on args.interface. Owner: D1."""
+    print(f"[*] Sniffing UDP on interface '{args.interface}' — Ctrl+C to stop.")
+    sniff(
+        iface=args.interface,
+        filter="udp",
+        prn=lambda pkt: packet_callback(pkt, state_table, args, alert_logger),
+        store=False,
+    )
 
 
 def check_flood(state: SourceState, args) -> tuple[bool, dict]:
-    """
-    Flood: any (src, dport) pair exceeds args.flood_threshold packets
-    per second on average over the window. Owner: D1.
-
-    Returns (fired, evidence). evidence has the schema
-    JsonAlertLogger expects in `measured` and `threshold`.
-    """
-    raise NotImplementedError("D1: implement.")
+    """Owner: D1. Fires if any single port's avg rate exceeds threshold."""
+    for dport, count in state.packets_per_dport.items():
+        rate = count / args.window
+        if rate > args.flood_threshold:
+            return True, {
+                "dport": dport,
+                "measured": round(rate, 2),
+                "threshold": args.flood_threshold,
+            }
+    return False, {}
 
 
 def check_spray(state: SourceState, args) -> tuple[bool, dict]:
-    """
-    Spray: |state.unique_dports| exceeds args.port_threshold within
-    args.window seconds. Owner: D1.
-    """
-    raise NotImplementedError("D1: implement.")
+    """Owner: D1. Fires if unique port count exceeds threshold in window."""
+    unique_count = len(state.unique_dports)
+    if unique_count > args.port_threshold:
+        return True, {
+            "measured": unique_count,
+            "threshold": args.port_threshold,
+        }
+    return False, {}
 
 
 # ======================================================================
@@ -230,21 +290,32 @@ def baseline_tuner(state_table, args) -> dict:
 # ======================================================================
 
 def main():
-    """
-    Integration glue. Owner: D1.
+    """Integration glue. Owner: D1."""
+    import signal
 
-    Steps:
-      1. parser = build_argparser(); args = parser.parse_args()      (D2)
-      2. logger = JsonAlertLogger(args.log)                           (D2)
-      3. state_table: dict[str, SourceState] = {}                     (D1)
-      4. start_sniffer(args, state_table, logger)                     (D1)
-      5. On SIGINT: logger.close().
+    # Step 1 — parse CLI (D2 provides build_argparser)
+    parser = build_argparser()
+    args = parser.parse_args()
 
-    Note: SourceState entries lazily attach a BurstWindow on first
-    packet via packet_callback. Keep it that way so D2's class stays
-    self-contained.
-    """
-    raise NotImplementedError("D1: wire main().")
+    # Convert whitelist comma-separated string → set
+    args.whitelist = set(args.whitelist.split(",")) if args.whitelist else set()
+
+    # Step 2 — create alert logger (D2 provides JsonAlertLogger)
+    logger = JsonAlertLogger(args.log)
+
+    # Step 3 — empty per-source state table
+    state_table: dict[str, SourceState] = {}
+
+    # Step 4 — handle Ctrl+C cleanly
+    def _shutdown(sig, frame):
+        print("\n[*] Shutting down — closing log.")
+        logger.close()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+
+    # Step 5 — start sniffing (blocks until Ctrl+C)
+    start_sniffer(args, state_table, logger)
 
 
 if __name__ == "__main__":

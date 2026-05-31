@@ -1,0 +1,74 @@
+# B2 — UDP Flooder + UDP Rate Anomaly Detector
+# 3-container isolated bridge network.
+# Detector shares the target's network namespace so it sees all unicast UDP
+# arriving at the target (a separate detector container on a Docker bridge
+# would not see attacker->target unicast).
+
+networks:
+  labnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.7.0/24
+
+services:
+  attacker:
+    image: python:3.11-slim
+    container_name: b2_attacker
+    hostname: attacker
+    networks:
+      labnet:
+        ipv4_address: 172.20.7.10
+    volumes:
+      - ./attacker:/app
+    working_dir: /app
+    command: >
+      bash -c "python3 udp_flooder.py
+               --target 172.20.7.20
+               --port 9999
+               --mode flood
+               --rate 100
+               --payload-size 64
+               --threads 4
+               --burst-on 3 --burst-off 5
+               --log /app/flood.log"
+    stdin_open: true
+    tty: true
+
+  target:
+    image: python:3.11-slim
+    container_name: b2_target
+    hostname: target
+    networks:
+      labnet:
+        ipv4_address: 172.20.7.20
+    volumes:
+      - ./target:/app
+    working_dir: /app
+    # Simple UDP echo server on port 9999
+    command: python3 udp_echo_server.py --port 9999
+
+  detector:
+    image: python:3.11-slim
+    container_name: b2_detector
+    # Share target's netns: detector sees every UDP packet arriving at the target.
+    network_mode: "service:target"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      - target
+    volumes:
+      - ./detector:/app
+    working_dir: /app
+    command: >
+      bash -c "apt-get update -qq &&
+               apt-get install -y --no-install-recommends tcpdump >/dev/null &&
+               pip install scapy --quiet &&
+               python3 udp_detector.py
+               --interface eth0
+               --flood-threshold 50
+               --port-threshold 20
+               --burst-multiplier 3
+               --window 30
+               --log /app/udp_alerts.log"
